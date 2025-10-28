@@ -2,38 +2,44 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import httpx
+import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent  # sua versão suporta este import
+from langgraph.prebuilt import create_react_agent  # compatível com sua versão
 
-# ========= Env =========
-load_dotenv()
+# ========= Carrega .env =========
+load_dotenv()  # lê .env do diretório atual
+
 TRELLO_KEY = os.getenv("TRELLO_KEY")
 TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
-if not TRELLO_KEY or not TRELLO_TOKEN:
-    raise RuntimeError("Defina TRELLO_KEY e TRELLO_TOKEN no .env ou ambiente.")
 
-# ========= Defaults (usados se o prompt não trouxer board/lista) =========
-DEFAULT_BOARD = "https://trello.com/b/S33WAXxl/nocapital"  # pode ser só o shortlink também
-DEFAULT_LIST = "A fazer"  # ajuste para o nome exato da lista no seu board
+# Defaults opcionais (podem vir do .env)
+ENV_DEFAULT_BOARD = os.getenv("DEFAULT_BOARD", "").strip()
+ENV_DEFAULT_LIST = os.getenv("DEFAULT_LIST", "").strip()
 
 # ========= Helpers =========
 def _to_rfc3339_from_text(text: str) -> str:
     """
     Converte 'amanhã 18:00-03:00' ou 'YYYY-MM-DD HH:MM-03:00' para RFC3339.
-    - timezone: se não vier, usa -03:00
-    - hora: se não vier, usa 09:00
-    - 'amanhã' = hoje + 1
-    - YYYY-MM-DD reconhecido
+    Regras:
+      - timezone: se não vier no texto, usa -03:00
+      - hora: se não vier, usa 09:00
+      - 'amanhã' = hoje + 1
+      - 'YYYY-MM-DD' reconhecido
     """
-    s = text.strip().lower()
+    s = (text or "").strip().lower()
+    if not s:
+        raise ValueError("Texto de data/hora vazio.")
+
     m_tz = re.search(r"([+-]\d{2}:\d{2})", s)
     tz = m_tz.group(1) if m_tz else "-03:00"
+
     m_hm = re.search(r"(\d{1,2}):(\d{2})", s)
     hh, mm = (int(m_hm.group(1)), int(m_hm.group(2))) if m_hm else (9, 0)
 
@@ -44,7 +50,9 @@ def _to_rfc3339_from_text(text: str) -> str:
         y, m, d = map(int, re.search(r"(\d{4})-(\d{2})-(\d{2})", s).groups())
         dt = datetime(y, m, d, hh, mm, 0)
     else:
+        # "hoje" ou texto sem data vira hoje
         dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + tz
 
 def _board_shortlink(board_ref: str) -> str:
@@ -53,7 +61,7 @@ def _board_shortlink(board_ref: str) -> str:
     return m.group(1) if m else board_ref
 
 def _get_list_id(board_ref: str, list_name: str) -> str:
-    """Busca o id da lista pelo nome dentro do board (shortlink/URL). Case-insensitive."""
+    """Busca o id da lista pelo nome dentro do board (shortlink/URL). Case-insensitive, tenta exact e contains."""
     short = _board_shortlink(board_ref)
     r = httpx.get(
         f"https://api.trello.com/1/boards/{short}/lists",
@@ -62,9 +70,11 @@ def _get_list_id(board_ref: str, list_name: str) -> str:
     )
     r.raise_for_status()
     lists = r.json()
+    # exact
     for lst in lists:
         if lst["name"].strip().lower() == list_name.strip().lower():
             return lst["id"]
+    # contains
     for lst in lists:
         if list_name.strip().lower() in lst["name"].strip().lower():
             return lst["id"]
@@ -80,14 +90,15 @@ def to_rfc3339(datetime_text: str) -> str:
 def resolve_list_id(board: str, list_name: str) -> str:
     """
     Retorna o idList a partir de (board, list_name).
-    'board' pode ser URL do board ou shortlink.
+    'board' pode ser URL do board ou shortlink. Se algum vier vazio, usa defaults do host.
     """
-    # Se vier vazio, usa defaults
-    if not board:
-        board = DEFAULT_BOARD
-    if not list_name:
-        list_name = DEFAULT_LIST
-    return _get_list_id(board, list_name)
+    _board = board.strip() or ENV_DEFAULT_BOARD
+    _list = list_name.strip() or ENV_DEFAULT_LIST
+    if not _board or not _list:
+        raise ValueError(
+            "Board e lista não informados. Passe via CLI (--board/--list) ou defina DEFAULT_BOARD/DEFAULT_LIST no .env."
+        )
+    return _get_list_id(_board, _list)
 
 @tool
 def trello_create_card(list_id: str, name: str, desc: str = "", due: str | None = None) -> Dict[str, Any]:
@@ -142,40 +153,71 @@ def trello_add_checklist(card_id: str, checklist_name: str, items: List[str]) ->
 
     return f"Checklist '{checklist_name}' criado com {len(items)} itens"
 
-# ========= LLM + Agente =========
-llm = ChatOllama(model="gpt-oss:20b", temperature=0)
-agent = create_react_agent(
-    llm,
-    tools=[to_rfc3339, resolve_list_id, trello_create_card, trello_set_desc, trello_add_checklist],
-)
-
-if __name__ == "__main__":
-    # Exemplo de uso super simples: só passe o que você quer que a IA gere.
-    # Se não mencionar board/lista, serão usados os defaults acima.
-    user_prompt = (
-        "gere um sistema de autenticação JWT em fastapi "
-        "(use o board/lista padrão caso eu não informe) "
-        "com prazo amanhã 18:00-03:00"
+# ========= CLI =========
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Agente Trello: gera cards profissionais (título, descrição e checklists) a partir de um prompt."
     )
+    p.add_argument("prompt", help="Pedido em linguagem natural (ex.: 'gere um sistema de autenticação JWT em FastAPI').")
+    p.add_argument("--board", help="URL ou shortlink do board. Se ausente, usa DEFAULT_BOARD do .env.", default=None)
+    p.add_argument("--list", dest="list_name", help="Nome da lista. Se ausente, usa DEFAULT_LIST do .env.", default=None)
+    p.add_argument("--due", help="Prazo em linguagem natural (ex.: 'amanhã 18:00-03:00').", default=None)
+    p.add_argument("--model", help="Modelo Ollama (default: gpt-oss:20b).", default=os.getenv("OLLAMA_MODEL", "gpt-oss:20b"))
+    p.add_argument("--temperature", type=float, help="Temperatura do LLM (default: 0).", default=float(os.getenv("LLM_TEMPERATURE", "0")))
+    p.add_argument("--verbose", action="store_true", help="Exibe logs do agente (útil para debug).")
+    return p.parse_args()
 
+# ========= Runner =========
+def main():
+    if not TRELLO_KEY or not TRELLO_TOKEN:
+        print("ERRO: Defina TRELLO_KEY e TRELLO_TOKEN no .env ou ambiente.")
+        sys.exit(1)
+
+    args = parse_args()
+
+    # prepara LLM
+    llm = ChatOllama(model=args.model, temperature=args.temperature)
+
+    # agenda ferramentas
+    tools = [to_rfc3339, resolve_list_id, trello_create_card, trello_set_desc, trello_add_checklist]
+    agent = create_react_agent(llm, tools=tools)
+
+    # system message profissional
     system_msg = (
         "Você é um agente de produtividade. NÃO peça key/token; já estão no ambiente. "
-        f"Se o usuário não informar board/lista, use board {DEFAULT_BOARD} e lista '{DEFAULT_LIST}'. "
+        f"Se o usuário não informar board/lista nas mensagens, use board '{args.board or ENV_DEFAULT_BOARD}' "
+        f"e lista '{args.list_name or ENV_DEFAULT_LIST}'. "
         "Fluxo: "
-        "1) Gere um TÍTULO curto do card. "
-        "2) Redija uma DESCRIÇÃO TÉCNICA estruturada (bullets), com entregáveis, critérios de aceite e notas de segurança. "
-        "3) Monte 1–3 CHECKLISTS com 4–10 itens cada, práticos e verificáveis. "
-        "4) Se houver data/hora natural, converta com 'to_rfc3339' e use como 'due'; se não houver, crie sem due. "
-        "5) Resolva o 'idList' com 'resolve_list_id' (board URL/shortlink + nome da lista, ou defaults). "
-        "6) Crie o card chamando 'trello_create_card' já com a descrição. "
+        "1) Gere um TÍTULO curto e claro do card. "
+        "2) Redija uma DESCRIÇÃO TÉCNICA estruturada (bullets), com objetivos, entregáveis, critérios de aceite, riscos/notas de segurança. "
+        "3) Monte 1–3 CHECKLISTS com 4–10 itens cada, práticos e verificáveis (por área, ex. Planejamento/Backend/QA). "
+        "4) Se houver data/hora natural no texto do usuário ou passada separadamente, converta com 'to_rfc3339' e use como 'due'; se não houver, crie sem due. "
+        "5) Resolva 'idList' com 'resolve_list_id' usando board/lista fornecidos (mensagem/CLI) ou defaults. "
+        "6) Crie o card com 'trello_create_card' (inclua a descrição). "
         "7) Crie os checklists com 'trello_add_checklist'. "
-        "Retorne no final SOMENTE a URL do card."
+        "Responda por fim SOMENTE a URL do card."
     )
 
-    msgs = [
+    # monta prompt do usuário
+    user_prompt = args.prompt.strip()
+    if args.due:
+        # sugerimos explicitamente um due extra, mas o agente também consegue detectar do user_prompt
+        user_prompt += f" | prazo: {args.due.strip()}"
+
+    # injeta, se o usuário quiser forçar board/list via CLI
+    if args.board:
+        user_prompt += f" | board: {args.board.strip()}"
+    if args.list_name:
+        user_prompt += f" | lista: {args.list_name.strip()}"
+
+    messages = [
         ("system", system_msg),
         ("user", user_prompt),
     ]
 
-    result = agent.invoke({"messages": msgs})
+    # executa
+    result = agent.invoke({"messages": messages})
     print(result["messages"][-1].content)
+
+if __name__ == "__main__":
+    main()
