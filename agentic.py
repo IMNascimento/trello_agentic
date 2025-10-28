@@ -11,15 +11,13 @@ from dotenv import load_dotenv
 
 from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
-from langgraph.prebuilt import create_react_agent  # compatível com sua versão
+from langgraph.prebuilt import create_react_agent 
 
-# ========= Carrega .env =========
-load_dotenv()  # lê .env do diretório atual
+load_dotenv() 
 
 TRELLO_KEY = os.getenv("TRELLO_KEY")
 TRELLO_TOKEN = os.getenv("TRELLO_TOKEN")
 
-# Defaults opcionais (podem vir do .env)
 ENV_DEFAULT_BOARD = os.getenv("DEFAULT_BOARD", "").strip()
 ENV_DEFAULT_LIST = os.getenv("DEFAULT_LIST", "").strip()
 
@@ -80,7 +78,6 @@ def _get_list_id(board_ref: str, list_name: str) -> str:
             return lst["id"]
     raise ValueError(f"Lista '{list_name}' não encontrada no board {board_ref}")
 
-# ========= Tools =========
 @tool
 def to_rfc3339(datetime_text: str) -> str:
     """Converte uma expressão de data/hora (ex: 'amanhã 18:00-03:00') para RFC3339."""
@@ -153,7 +150,6 @@ def trello_add_checklist(card_id: str, checklist_name: str, items: List[str]) ->
 
     return f"Checklist '{checklist_name}' criado com {len(items)} itens"
 
-# ========= CLI =========
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Agente Trello: gera cards profissionais (título, descrição e checklists) a partir de um prompt."
@@ -167,7 +163,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--verbose", action="store_true", help="Exibe logs do agente (útil para debug).")
     return p.parse_args()
 
-# ========= Runner =========
 def main():
     if not TRELLO_KEY or not TRELLO_TOKEN:
         print("ERRO: Defina TRELLO_KEY e TRELLO_TOKEN no .env ou ambiente.")
